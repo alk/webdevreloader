@@ -152,7 +152,10 @@ def anything_changed?
          rescue Errno::ENOENT
            return true
          end
-    return true if st.mtime.to_i > mtime
+    if st.mtime.to_i > mtime
+      p_log :child, "change detected on: ", path
+      return true
+    end
   end
   false
 end
