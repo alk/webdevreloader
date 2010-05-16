@@ -70,13 +70,14 @@ def kill_child!(wait = false)
   p_log :child, "killing child!"
   Process.kill("KILL", -$child_pgrp) rescue nil
   Process.kill("KILL", $child_pgrp) rescue nil
-  $child_pgrp = nil
+  $child_pgrp, pid = nil, $child_pgrp
   $child_rd_pipe.close rescue nil
   $child_rd_pipe = nil
   if wait
     poll_for_condition do
       !port_busyness($child_port)
     end
+    Process::waitpid(pid, Process::WNOHANG)
   end
 end
 
