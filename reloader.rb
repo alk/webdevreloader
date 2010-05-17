@@ -92,6 +92,7 @@ at_exit do
 end
 
 $child_port = 3000
+$child_spawn_timeout = 30
 
 def child_alife?
   $child_rd_pipe.read_nonblock(1)
@@ -118,7 +119,7 @@ def spawn_child!
   wr.close
   $child_rd_pipe = rd
   Process.setpgid($child_pgrp, $child_pgrp)
-  poll_for_condition(15) do
+  poll_for_condition($child_spawn_timeout) do
     raise "Failed to exec child" unless child_alife?
     port_busyness($child_port)
   end
