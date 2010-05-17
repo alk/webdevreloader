@@ -6,6 +6,7 @@ require 'thread'
 
 module Kernel
   def p_log(category, message, *extra)
+    return if category.to_s =~ /_v$/ # suppress verbose messages
     return if category == :downstream && message =~ /^got something/
     return if category == :http
     STDOUT.print category, ": "
@@ -82,7 +83,7 @@ def kill_child!(wait = false)
 end
 
 at_exit do
-  p_log :child, "atexit!"
+  p_log :child_v, "atexit!"
   if $child_pgrp
     kill_child!
   end
@@ -321,7 +322,7 @@ class Reloader
     def proxy_request(request)
       @process_mutex.synchronize do
         raise EOFError if @socket.closed?
-        p_log :downstream, "sending: #{request.inspect}"
+        p_log :downstream_v, "sending: #{request.inspect}"
         @socket << request
         counter = @response_counter
         while @response_counter == counter
