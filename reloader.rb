@@ -300,6 +300,9 @@ class Reloader
       while self.loop_iteration != :eof
       end
       close
+    rescue EOFError, Errno::ECONNRESET
+      close rescue nil
+      raise
     end
 
     def close
