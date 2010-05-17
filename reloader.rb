@@ -390,7 +390,35 @@ class Reloader
   end
 end
 
-Reloader.new().loop do |child_connection|
+$server_port = 8080
+$custom_patterns = false
+
+opts = OptionParser.new
+opts.banner = "Usage: #{File.basename($0)} [options] command..."
+opts.on("-u", "--upstream-port=VAL", Integer) {|x| $server_port = x}
+opts.on("-d", "--downstream-port=VAL", Integer) {|x| $child_port = x}
+opts.on("-T", "--spawn-timeout=VAL", Float) {|x| $child_spawn_timeout = x}
+opts.on("-s", "--kill-signal=VAL") {|x| $kill_signal = x}
+opts.on("-w", "--watch=VAL") do |x|
+  unless $custom_patterns
+    $custom_patterns = true
+    $interesting_files_patterns = []
+  end
+  $interesting_files_patterns << x
+end
+new_argv = opts.parse(*ARGV)
+ARGV.replace(new_argv)
+
+if ARGV.empty?
+  puts "Need command to spawn child"
+  exit 1
+end
+
+p_log :opts, "child_port: ", $child_port
+p_log :opts, "server_port: ", $server_port
+p_log :opts, "interesting_files_patterns: ", $interesting_files_patterns
+
+Reloader.new($server_port).loop do |child_connection|
   Thread.run_diag do
     child_connection.loop
   end
