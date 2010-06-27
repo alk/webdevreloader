@@ -1,0 +1,37 @@
+Smart web application reloader
+------------------------------
+
+This is simple http request forwarder that checks your application
+sources for changes and transparently restarts it if there are any.
+
+It works with any web technology and provides development convenience
+similar (but superior) to Rails development mode reloading.
+
+Make your source change and than simply hit reload button. Reloader
+will notice change and will transparently restart your application.
+
+Usage
+-----
+
+Upstream port (the one you should point your broswer to) is controlled
+by -u option. Downstream port where your application server listens is
+controlled by -d option. You can pass file patterns to check for
+changes by -w options. Rest of command line arguments are interpreted
+as a command to run your application.
+
+All options has defaults suitable for Rails applications. In this case
+just use command 'reloader ./script/server'.
+
+Other cases need suitable options. For example I use the following
+command line to run ns_server which is erlang application:
+
+reloader -T 30 -s TERM -u 3000 -d 8080 -w '**/*.erl' -w '**/*.js' -- sh -c 'make -j3 fast-rebuild && ./start_shell.sh -noshell'
+
+This command forwards port 3000 to port 8080 (erlang server binds to
+8080). It also checks mtimes of all erlang (*.erl) and javascript
+(*.js) sources.
+
+As you can see you can easily invoke make to (re)build
+application. Also note that your application is run as background
+process group, so it should not try to read stdin. I pass -noshell to
+erlang to avoid that.
