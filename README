@@ -35,3 +35,9 @@ As you can see you can easily invoke make to (re)build
 application. Also note that your application is run as background
 process group, so it should not try to read stdin. I pass -noshell to
 erlang to avoid that.
+
+
+License
+-------
+
+GPLv3. See COPYING.
