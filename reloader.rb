@@ -4,6 +4,9 @@ require 'socket'
 require 'optparse'
 require 'thread'
 
+require "rubygems"
+require "xray/thread_dump_signal_handler" rescue nil
+
 module Kernel
   def p_log(category, message, *extra)
     return if category.to_s =~ /_v$/ # suppress verbose messages
@@ -14,12 +17,6 @@ module Kernel
     ex = extra.map {|e| e.inspect}.join(", ")
     STDOUT.puts ex
   end
-end
-
-def test_exception
-  raise "Asd"
-rescue Exception
-  $!
 end
 
 class Exception
@@ -48,154 +45,233 @@ class Thread
   end
 end
 
-def port_busyness(port)
-  TCPSocket.new('127.0.0.1', port).close
-  true
-rescue Errno::ECONNREFUSED
-  false
+# simple recursive (for readers) rwlock that prefers writers over
+# readers
+class RWLock
+  def initialize
+    @mutex = Mutex.new
+    @state = :free
+    @shared_q = ConditionVariable.new
+    @shared_counter = 0
+    @exclusive_q = ConditionVariable.new
+
+    @exclusive_requests = 0
+  end
+
+  def take_shared
+    @mutex.synchronize do
+      while true
+        if @exclusive_requests == 0
+          case @state
+          when :free, :shared
+            @shared_counter += 1
+            @state = :shared
+            return
+          end
+        end
+
+        p_log :lock, "sleeping for shared lock"
+        @shared_q.wait(@mutex)
+      end
+    end
+  end
+
+  def release_shared
+    @mutex.synchronize do
+      @shared_counter -= 1
+      @state = :free if @shared_counter == 0
+      @exclusive_q.signal
+    end
+  end
+
+  def take_exclusive
+    @mutex.synchronize do
+      @exclusive_requests += 1
+      while true
+        if @state == :free
+          @state = :exclusive
+          return
+        end
+
+        p_log :lock, "sleeping for x-lock"
+        @exclusive_q.wait(@mutex)
+      end
+    end
+  end
+
+  def release_exclusive
+    @mutex.synchronize do
+      @exclusive_requests -= 1
+
+      @state = :free
+      if @exclusive_requests > 0
+        @exclusive_q.signal
+      else
+        @shared_q.signal
+      end
+    end
+  end
+
+  def cannot_raise
+    yield
+  rescue Exception
+    puts "BUG!"
+    raise
+  end
+
+  def synchronize_shared
+    take_shared
+    yield
+  ensure
+    cannot_raise do
+      release_shared
+    end
+  end
+
+  def synchronize_exclusive
+    take_exclusive
+    yield
+  ensure
+    cannot_raise do
+      release_exclusive
+    end
+  end
 end
 
-def poll_for_condition(timeout=5)
-  target = Time.now.to_f + timeout
-  begin
-    return if yield
-    sleep 0.05
-  end while (Time.now.to_f <= target)
-  raise Errno::ETIMEDOUT
-end
 
 $child_rd_pipe = nil
 $child_pgrp = nil
 
 $kill_signal = "KILL"
 
-def kill_child!(wait = false)
-  p_log :child, "killing child!"
-  Process.kill($kill_signal, -$child_pgrp) rescue nil
-  Process.kill($kill_signal, $child_pgrp) rescue nil
-  $child_pgrp, pid = nil, $child_pgrp
-  $child_rd_pipe.close rescue nil
-  $child_rd_pipe = nil
-  if wait
-    poll_for_condition do
-      !port_busyness($child_port)
+$child_port = 3000
+$child_spawn_timeout = 30
+
+module ChildController
+  module_function
+
+  def port_busyness(port)
+    TCPSocket.new('127.0.0.1', port).close
+    true
+  rescue Errno::ECONNREFUSED
+    false
+  end
+
+  def poll_for_condition(timeout=5)
+    target = Time.now.to_f + timeout
+    begin
+      return if yield
+      sleep 0.05
+    end while (Time.now.to_f <= target)
+    raise Errno::ETIMEDOUT
+  end
+
+  def kill_child!(wait = false)
+    p_log :child, "killing child!"
+    Process.kill($kill_signal, -$child_pgrp) rescue nil
+    Process.kill($kill_signal, $child_pgrp) rescue nil
+    $child_pgrp, pid = nil, $child_pgrp
+    $child_rd_pipe.close rescue nil
+    $child_rd_pipe = nil
+    if wait
+      poll_for_condition do
+        !port_busyness($child_port)
+      end
+      Process::waitpid(pid, Process::WNOHANG)
     end
-    Process::waitpid(pid, Process::WNOHANG)
+  end
+
+  def child_alife?
+    $child_rd_pipe.read_nonblock(1)
+    raise "Cannot happen"
+  rescue Errno::EAGAIN
+    true
+  rescue EOFError
+    false
+  end
+
+  def spawn_child!
+    p_log :child, "spawning child!"
+    $child_pgrp = nil
+    rd, wr = IO.pipe
+    $child_pgrp = fork do
+      rd.close
+      begin
+        Process.setpgid(Process.pid, 0)
+      rescue Errno::EACCESS
+      end
+      begin
+        exec(*ARGV)
+      rescue Exception
+        puts "failed to exec: #{$!.inspect}"
+      end
+    end
+    wr.close
+    $child_rd_pipe = rd
+    Process.setpgid($child_pgrp, $child_pgrp)
+    poll_for_condition($child_spawn_timeout) do
+      raise "Failed to exec child" unless child_alife?
+      port_busyness($child_port)
+    end
+    p_log :child, "child is ready"
+  rescue Exception
+    if $child_pgrp
+      kill_child!
+    end
+    raise $!
   end
 end
 
 at_exit do
   p_log :child_v, "atexit!"
   if $child_pgrp
-    kill_child!
+    ChildController.kill_child!
   end
-end
-
-$child_port = 3000
-$child_spawn_timeout = 30
-
-def child_alife?
-  $child_rd_pipe.read_nonblock(1)
-  raise "Cannot happen"
-rescue Errno::EAGAIN
-  true
-rescue EOFError
-  false
-end
-
-def spawn_child!
-  p_log :child, "spawning child!"
-  $child_pgrp = nil
-  rd, wr = IO.pipe
-  $child_pgrp = fork do
-    rd.close
-    Process.setpgid(Process.pid, 0)
-    begin
-      exec(*ARGV)
-    rescue Exception
-      puts "failed to exec: #{$!.inspect}"
-    end
-  end
-  wr.close
-  $child_rd_pipe = rd
-  Process.setpgid($child_pgrp, $child_pgrp)
-  poll_for_condition($child_spawn_timeout) do
-    raise "Failed to exec child" unless child_alife?
-    port_busyness($child_port)
-  end
-  p_log :child, "child is ready"
-rescue Exception
-  if $child_pgrp
-    kill_child!
-  end
-  raise $!
 end
 
 $interesting_files_patterns = ["vendor/**/*", "lib/**/*", "app/**/*", "config/**/*"]
 $mtimes = {}
 
-def collect_intersting_files!
-  mtimes = $mtimes = {}
-  names = $interesting_files_patterns.map {|p| Dir[p]}.flatten.sort.uniq
-#  p_log :collect_intersting_files!, "names: ", names
-  names.each do |path|
-    st = begin
-           File.stat(path)
-         rescue Errno::ENOENT
-           next
-         end
-    next unless st.file?
-    mtimes[path] = st.mtime.to_i
-  end
-end
+module DirWatcher
+  module_function
 
-def anything_changed?
-  $mtimes.each do |path, mtime|
-    st = begin
-           File.stat(path)
-         rescue Errno::ENOENT
-           return true
-         end
-    if st.mtime.to_i > mtime
-      p_log :child, "change detected on: ", path
-      return true
+  def collect_interesting_files!
+    mtimes = $mtimes = {}
+    names = $interesting_files_patterns.map {|p| Dir[p]}.flatten.sort.uniq
+    #  p_log :collect_interesting_files!, "names: ", names
+    names.each do |path|
+      st = begin
+             File.stat(path)
+           rescue Errno::ENOENT
+             next
+           end
+      next unless st.file?
+      mtimes[path] = st.mtime.to_i
     end
   end
-  false
-end
 
-def dir_watcher_hook
-  unless $child_pgrp
-    spawn_child!
-
-    collect_intersting_files!
-
-    return
-  end
-
-  p_log :child, "checking changes"
-  if anything_changed?
-    p_log :child, "changed!"
-    kill_child!(true)
-    p_log :child, "old worker is dead"
-    dir_watcher_hook
+  def anything_changed?
+    $mtimes.each do |path, mtime|
+      st = begin
+             File.stat(path)
+           rescue Errno::ENOENT
+             return true
+           end
+      if st.mtime.to_i > mtime
+        p_log :child, "change detected on: ", path
+        return true
+      end
+    end
+    false
   end
 end
 
-$dir_watcher_mutex = Mutex.new
-$dir_watcher = lambda do
-  $dir_watcher_mutex.synchronize do
-    dir_watcher_hook
-  end
-end
 $socket_factory = lambda {TCPSocket.new('127.0.0.1', $child_port)}
 
 class Reloader
   class << self
-    attr_accessor :dir_watcher
     attr_accessor :socket_factory
   end
-  self.dir_watcher = $dir_watcher
   self.socket_factory = $socket_factory
 
   module Utils
@@ -296,13 +372,10 @@ class Reloader
       @downstream.proxy_request(request)
     end
 
-    def loop
-      while self.loop_iteration != :eof
-      end
+    def run
+      loop_iteration
+    ensure
       close
-    rescue EOFError, Errno::ECONNRESET
-      close rescue nil
-      raise
     end
 
     def close
@@ -317,60 +390,26 @@ class Reloader
 
     def initialize(socket, upstream_socket)
       @socket = socket
-      @thread = Thread.run_diag(InterruptWork) {self.run_thread_loop!}
-      @process_mutex = Mutex.new
-      @process_cvar = ConditionVariable.new
-      @response_counter = 0
       @upstream_socket = upstream_socket
-      @closed = false
     end
 
     def proxy_request(request)
-      @process_mutex.synchronize do
-        raise EOFError if @socket.closed?
-        p_log :downstream_v, "sending: #{request.inspect}"
-        @socket << request
-        counter = @response_counter
-        while @response_counter == counter
-          @process_cvar.wait(@process_mutex)
-        end
-      end
-    end
+      @socket << request
 
-    class InterruptWork < Exception
+      response, extra = read_http_something("", @socket)
+      if response.empty?
+        p_log :downstream, "downstream closed on in-flight request"
+        return :eof
+      end
+
+      p_log :downstream, "got something: #{response.inspect}"
+      raise unless extra.empty?
+
+      @upstream_socket << response
     end
 
     def close
       return if @socket.closed?
-
-      @socket.close_write
-      @thread.raise InterruptWork
-      begin
-        @thread.join
-      rescue InterruptWork
-        # ignore
-      end
-      @socket.close
-    end
-
-    def run_thread_loop!
-      while true
-        response, extra = read_http_something("", @socket)
-        break if response.empty?
-
-        p_log :downstream, "got something: #{response.inspect}"
-        raise unless extra.empty?
-        @upstream_socket << response
-
-        @process_mutex.synchronize do
-          @response_counter += 1
-          @process_cvar.signal
-          if response == ""
-            @socket.close
-            return
-          end
-        end
-      end
       @socket.close
     end
   end
@@ -378,17 +417,47 @@ class Reloader
   def initialize(port=8080)
     @server = TCPServer.new(port)
     set_cloexec(@server)
+    @lock = RWLock.new
   end
+
+  def check_dir!
+    unless $child_pgrp
+      DirWatcher.collect_interesting_files!
+      ChildController.spawn_child!
+    end
+
+    p_log :child, "checking changes"
+    if DirWatcher.anything_changed?
+      p_log :child, "changed!"
+
+      @lock.synchronize_exclusive do
+        ChildController.kill_child!(true)
+      end
+
+      p_log :child, "old worker is dead"
+      check_dir!
+    end
+  end
+
   def loop
-    Reloader.dir_watcher.call
+    check_dir!
+    lock = @lock
+
     while true
       socket = @server.accept
       set_cloexec(socket)
-      Reloader.dir_watcher.call
-      downstream_socket = Reloader.socket_factory.call
-      set_cloexec(downstream_socket)
-      downstream = DownstreamConnection.new(downstream_socket, socket)
-      yield UpstreamConnection.new(socket, downstream)
+
+      check_dir!
+
+      Thread.run_diag do
+        p_log :upstream, "spawned new thread"
+        lock.synchronize_shared do
+          downstream_socket = Reloader.socket_factory.call
+          set_cloexec(downstream_socket)
+          downstream = DownstreamConnection.new(downstream_socket, socket)
+          UpstreamConnection.new(socket, downstream).run
+        end
+      end
     end
   end
 end
@@ -421,8 +490,4 @@ p_log :opts, "child_port: ", $child_port
 p_log :opts, "server_port: ", $server_port
 p_log :opts, "interesting_files_patterns: ", $interesting_files_patterns
 
-Reloader.new($server_port).loop do |child_connection|
-  Thread.run_diag do
-    child_connection.loop
-  end
-end
+Reloader.new($server_port).loop
