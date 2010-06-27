@@ -20,7 +20,8 @@ changes by -w options. Rest of command line arguments are interpreted
 as a command to run your application.
 
 All options has defaults suitable for Rails applications. In this case
-just use command 'reloader ./script/server'.
+just use command 'reloader ./script/server'. But remember to point
+your browser to port 8080, not 3000.
 
 Other cases need suitable options. For example I use the following
 command line to run ns_server which is erlang application:
