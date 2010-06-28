@@ -21,7 +21,8 @@ as a command to run your application.
 
 All options has defaults suitable for Rails applications. In this case
 just use command 'reloader ./script/server'. But remember to point
-your browser to port 8080, not 3000.
+your browser to port 8080, not 3000. You should also turn off Rails
+development mode reloading by setting config.cache_classes to true.
 
 Other cases need suitable options. For example I use the following
 command line to run ns_server which is erlang application:
