@@ -313,7 +313,7 @@ class Reloader
     def read_http_something(initial_data, io)
       out = initial_data.dup
       begin
-        io.readpartial(16384, out)
+        out << io.readpartial(16384)
         p_log :http, "got out: ", out
         p_log :http_request, "req: ", out.split("\n").first.strip
       end while out !~ HTTP_END_REQUEST_RE
@@ -364,16 +364,19 @@ class Reloader
                 out[length..-1].dup]
       end
 
+      p_log :http, "out before connection close loop:", out
       while true
         begin
-          io.readpartial(16384, out)
+          out << io.readpartial(16384)
         rescue EOFError
+          p_log :http, "breaking out out close await loop", out
           break
         end
       end
 
       [out, ""]
     rescue EOFError
+      p_log :http, "EOFError: #{out.size}, #{initial_data.size}"
       return ["", out] if out.size == initial_data.size
       raise "Partial request or response"
     end
