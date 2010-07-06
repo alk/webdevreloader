@@ -144,7 +144,6 @@ class RWLock
 end
 
 $gentle_killer = false
-$use_hup = false
 
 $child_rd_pipe = nil
 $child_pgrp = nil
@@ -208,17 +207,15 @@ module ChildController
     rd, wr = IO.pipe
 
     sleeper_pid = nil
-    if $use_hup
-      sleeper_pid = fork do
-        Process.setpgid(0, 0)
-        $0 = "sleeper: " + $0
-        Process.kill("STOP", 0)
-      end
-      Process.wait(sleeper_pid, Process::WUNTRACED)
+    sleeper_pid = fork do
+      Process.setpgid(0, 0)
+      $0 = "sleeper: " + $0
+      Process.kill("STOP", 0)
     end
+    Process.wait(sleeper_pid, Process::WUNTRACED)
 
     $child_pgrp = fork do
-      Process.setpgid(Process.pid, sleeper_pid || 0)
+      Process.setpgid(Process.pid, sleeper_pid)
       rd.close
       STDIN.reopen("/dev/null")
       begin
@@ -231,12 +228,10 @@ module ChildController
     wr.close
     $child_rd_pipe = rd
     begin
-      Process.setpgid($child_pgrp, sleeper_pid || $child_pgrp)
+      Process.setpgid($child_pgrp, sleeper_pid)
     rescue Errno::EACCESS
     end
-    if sleeper_pid
-      $child_pgrp = sleeper_pid
-    end
+    $child_pgrp = sleeper_pid
     poll_for_condition($child_spawn_timeout) do
       raise "The child exited before creating server socket" unless child_alife?
       port_busyness($child_port)
@@ -519,7 +514,6 @@ opts.on("-d", "--downstream-port=VAL", Integer, "Port where app server listens")
 opts.on("-T", "--spawn-timeout=VAL", Float, "Timeout for app server port readiness") {|x| $child_spawn_timeout = x}
 opts.on("-s", "--kill-signal=VAL", "Signal used to kill child") {|x| $kill_signal = x}
 opts.on("-g", "--kill-gently", "Wait requests completion before killing/respawning") { $gentle_killer = true }
-opts.on("-h", "--use-hup", "Arrange delivery of SIGHUP when reloader dies") { $use_hup = true }
 opts.on("-w", "--watch=VAL", "File pattern to watch (add as many as you want)") do |x|
   unless $custom_patterns
     $custom_patterns = true
