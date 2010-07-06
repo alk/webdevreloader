@@ -19,6 +19,11 @@ controlled by -d option. You can pass file patterns to check for
 changes by -w options. Rest of command line arguments are interpreted
 as a command to run your application.
 
+By default reloader kills application even when there is active
+request execution. You can pass '--kill-gently' to make it wait active
+requests completion before killing application. This usually matters
+only for applications that use push.
+
 All options has defaults suitable for Rails applications. In this case
 just use command 'reloader ./script/server'. But remember to point
 your browser to port 8080, not 3000. You should also turn off Rails
