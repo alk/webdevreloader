@@ -4,15 +4,19 @@
 require 'socket'
 require 'optparse'
 require 'thread'
+require 'fcntl'
 
 require "rubygems"
 require "xray/thread_dump_signal_handler" rescue nil
+
+require 'io/wait'
 
 module Kernel
   def p_log(category, message, *extra)
     return if category.to_s =~ /_v$/ # suppress verbose messages
     return if category == :downstream && message =~ /^got something/
     return if category == :http
+    STDOUT.print Thread.current.object_id, ": "
     STDOUT.print category, ": "
     STDOUT.print message
     ex = extra.map {|e| e.inspect}.join(", ")
@@ -94,7 +98,7 @@ class RWLock
           return
         end
 
-        p_log :lock, "sleeping for x-lock"
+        p_log :lock, "sleeping for x-lock. #{self.inspect}"
         @exclusive_q.wait(@mutex)
       end
     end
@@ -139,6 +143,8 @@ class RWLock
   end
 end
 
+$gentle_killer = false
+$use_hup = false
 
 $child_rd_pipe = nil
 $child_pgrp = nil
@@ -178,7 +184,12 @@ module ChildController
       poll_for_condition do
         !port_busyness($child_port)
       end
-      Process::waitpid(pid, Process::WNOHANG)
+      begin
+        loop do
+          Process::waitpid(pid, Process::WNOHANG)
+        end
+      rescue Errno::ECHILD
+      end
     end
   end
 
@@ -195,23 +206,39 @@ module ChildController
     p_log :child, "spawning child!"
     $child_pgrp = nil
     rd, wr = IO.pipe
-    $child_pgrp = fork do
-      rd.close
-      begin
-        Process.setpgid(Process.pid, 0)
-      rescue Errno::EACCESS
+
+    sleeper_pid = nil
+    if $use_hup
+      sleeper_pid = fork do
+        Process.setpgid(0, 0)
+        $0 = "sleeper: " + $0
+        Process.kill("STOP", 0)
       end
+      Process.wait(sleeper_pid, Process::WUNTRACED)
+    end
+
+    $child_pgrp = fork do
+      Process.setpgid(Process.pid, sleeper_pid || 0)
+      rd.close
+      STDIN.reopen("/dev/null")
       begin
         exec(*ARGV)
       rescue Exception
         puts "failed to exec: #{$!.inspect}"
       end
     end
+    
     wr.close
     $child_rd_pipe = rd
-    Process.setpgid($child_pgrp, $child_pgrp)
+    begin
+      Process.setpgid($child_pgrp, sleeper_pid || $child_pgrp)
+    rescue Errno::EACCESS
+    end
+    if sleeper_pid
+      $child_pgrp = sleeper_pid
+    end
     poll_for_condition($child_spawn_timeout) do
-      raise "Failed to exec child" unless child_alife?
+      raise "The child exited before creating server socket" unless child_alife?
       port_busyness($child_port)
     end
     p_log :child, "child is ready"
@@ -293,6 +320,7 @@ class Reloader
       begin
         io.readpartial(16384, out)
         p_log :http, "got out: ", out
+        p_log :http_request, "req: ", out.split("\n").first.strip
       end while out !~ HTTP_END_REQUEST_RE
 
       offset = $~.begin(0)
@@ -369,6 +397,7 @@ class Reloader
 
     def loop_iteration
       request, @buffer = read_http_something(@buffer, @socket)
+      p_log :upstream_v, "out of read_http_something", request, @buffer
       return :eof if request.empty?
       @downstream.proxy_request(request)
     end
@@ -396,6 +425,7 @@ class Reloader
 
     def proxy_request(request)
       @socket << request
+      p_log :downstream, "sent request to downstream"
 
       response, extra = read_http_something("", @socket)
       if response.empty?
@@ -422,7 +452,9 @@ class Reloader
   end
 
   def check_dir!
+    p_log :child, "entering check_dir"
     unless $child_pgrp
+      p_log :child, "no child running"
       DirWatcher.collect_interesting_files!
       ChildController.spawn_child!
     end
@@ -431,9 +463,16 @@ class Reloader
     if DirWatcher.anything_changed?
       p_log :child, "changed!"
 
-      @lock.synchronize_exclusive do
-        ChildController.kill_child!(true)
+      if $gentle_killer
+        # We spawn shared lock takers, so we can release lock right away
+        # Taking lock ensures that every in-progress request is completed
+        # and that's all we need.
+        @lock.synchronize_exclusive do
+        end
       end
+
+      system "notify-send -t 1000 'killing child'"
+      ChildController.kill_child!(true)
 
       p_log :child, "old worker is dead"
       check_dir!
@@ -446,9 +485,16 @@ class Reloader
 
     while true
       socket = @server.accept
+      p_log :upstream, "got new connection: #{socket.fileno}"
       set_cloexec(socket)
 
-      check_dir!
+      begin
+        check_dir!
+      rescue Exception
+        p_log :critical, "Dropping connection due to exception from check_dir!:\n#{$!.diagnose}"
+        socket.close rescue nil
+        next
+      end
 
       Thread.run_diag do
         p_log :upstream, "spawned new thread"
@@ -468,11 +514,13 @@ $custom_patterns = false
 
 opts = OptionParser.new
 opts.banner = "Usage: #{File.basename($0)} [options] command..."
-opts.on("-u", "--upstream-port=VAL", Integer) {|x| $server_port = x}
-opts.on("-d", "--downstream-port=VAL", Integer) {|x| $child_port = x}
-opts.on("-T", "--spawn-timeout=VAL", Float) {|x| $child_spawn_timeout = x}
-opts.on("-s", "--kill-signal=VAL") {|x| $kill_signal = x}
-opts.on("-w", "--watch=VAL") do |x|
+opts.on("-u", "--upstream-port=VAL", Integer, "Port to listen on") {|x| $server_port = x}
+opts.on("-d", "--downstream-port=VAL", Integer, "Port where app server listens") {|x| $child_port = x}
+opts.on("-T", "--spawn-timeout=VAL", Float, "Timeout for app server port readiness") {|x| $child_spawn_timeout = x}
+opts.on("-s", "--kill-signal=VAL", "Signal used to kill child") {|x| $kill_signal = x}
+opts.on("-g", "--kill-gently", "Wait requests completion before killing/respawning") { $gentle_killer = true }
+opts.on("-h", "--use-hup", "Arrange delivery of SIGHUP when reloader dies") { $use_hup = true }
+opts.on("-w", "--watch=VAL", "File pattern to watch (add as many as you want)") do |x|
   unless $custom_patterns
     $custom_patterns = true
     $interesting_files_patterns = []
