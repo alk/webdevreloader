@@ -4,7 +4,7 @@ Gem::Specification.new do |s|
   s.platform = Gem::Platform::RUBY
   s.summary = "Smart web application reloader"
   s.name = "webdevreloader"
-  s.version = "0.5"
+  s.version = "0.6"
   s.author = "Aliaksey Kandratsenka"
   s.email = "alk@tut.by"
   s.require_paths = ['bin']
